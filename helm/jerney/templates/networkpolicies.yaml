@@ -1,0 +1,37 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jerney-db-allow-backend-only
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: jerney-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: jerney-backend
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jerney-backend-allow-frontend-only
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: jerney-backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: jerney-frontend
+      ports:
+        - port: 5000
+          protocol: TCP

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: jerney-backend
+  labels:
+    app.kubernetes.io/name: jerney-backend
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    app.kubernetes.io/component: backend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: jerney-backend
+  ports:
+    - port: 5000
+      targetPort: 5000
+      protocol: TCP
