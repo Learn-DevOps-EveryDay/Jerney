@@ -75,7 +75,7 @@ async function fetchEpssScores(cves) {
   if (!cves || cves.length === 0) return {};
   console.log(`Fetching EPSS scores for ${cves.length} CVEs...`);
   const epssMap = {};
-  
+
   const chunkSize = 50;
   for (let i = 0; i < cves.length; i += chunkSize) {
     const chunk = cves.slice(i, i + chunkSize);
@@ -100,19 +100,48 @@ async function fetchEpssScores(cves) {
   return epssMap;
 }
 
+function findDependencyPaths(dependencies, targetPkg, currentPath = []) {
+  if (!dependencies) return [];
+  let paths = [];
+  for (const [name, pkg] of Object.entries(dependencies)) {
+    const newPath = [...currentPath, `${name}@${pkg.version || 'unknown'}`];
+    if (name === targetPkg) {
+      paths.push(newPath);
+    }
+    if (pkg.dependencies) {
+      paths.push(...findDependencyPaths(pkg.dependencies, targetPkg, newPath));
+    }
+  }
+  return paths;
+}
+
+function formatDependencyChain(pathArray) {
+  if (!pathArray || pathArray.length === 0) return 'Not found in dependency graph';
+  if (pathArray.length === 1) return pathArray[0];
+  let res = pathArray[0] + '\n';
+  for (let i = 1; i < pathArray.length; i++) {
+    const isLast = i === pathArray.length - 1;
+    const prefix = '  '.repeat(i - 1) + (isLast ? '└── ' : '├── ');
+    res += prefix + pathArray[i] + (isLast ? '' : '\n');
+  }
+  return res;
+}
+
 async function main() {
   const sbomPath = process.argv[2];
   const trivyPath = process.argv[3];
+  const graphPath = process.argv[4];
   const reportPath = 'remediation-report.json';
 
   console.log(`Analyzing SBOM: ${sbomPath}`);
   console.log(`Analyzing Trivy: ${trivyPath}`);
+  console.log(`Analyzing Dependency Graph: ${graphPath || 'None'}`);
 
   // Default empty report
   const defaultReport = { patches: [] };
 
   if (!sbomPath || !trivyPath) {
-    console.error('Missing arguments. Usage: node gemini-analysis.js <sbom-file> <trivy-file>');
+    console.error('Missing arguments. Usage: node gemini-analysis.js <sbom-file> <trivy-file> [graph-file]');
     fs.writeFileSync(reportPath, JSON.stringify(defaultReport, null, 2));
     process.exit(0);
   }
@@ -159,7 +188,7 @@ async function main() {
         for (const vuln of result.Vulnerabilities) {
           const pkgName = vuln.PkgName;
           const cveId = vuln.VulnerabilityID;
-          
+
           if (cveId) cveSet.add(cveId);
 
           if (!vulnerablePackagesMap.has(pkgName)) {
@@ -181,7 +210,7 @@ async function main() {
 
           const pkgData = vulnerablePackagesMap.get(pkgName);
           if (vuln.FixedVersion) pkgData.fixedVersions.add(vuln.FixedVersion);
-          
+
           pkgData.vulnerabilities.push({
             id: cveId,
             severity: vuln.Severity
@@ -195,6 +224,17 @@ async function main() {
     console.log('No vulnerable packages found. Generating empty remediation report.');
     fs.writeFileSync(reportPath, JSON.stringify(defaultReport, null, 2));
     process.exit(0);
+  }
+
+  // Load Dependency Graph
+  let graphData = null;
+  try {
+    if (graphPath && fs.existsSync(graphPath)) {
+      graphData = JSON.parse(fs.readFileSync(graphPath, 'utf8'));
+      console.log('Successfully loaded dependency graph.');
+    }
+  } catch (err) {
+    console.warn(`Could not read dependency graph:`, err.message);
   }
 
   // Fetch Threat Intel Enrichments
@@ -213,6 +253,18 @@ async function main() {
       };
     });
     pkg.fixedVersions = Array.from(pkg.fixedVersions);
+    
+    // Attach Dependency Chain
+    if (graphData && graphData.dependencies) {
+      const paths = findDependencyPaths(graphData.dependencies, pkg.name);
+      if (paths.length > 0) {
+        paths.sort((a, b) => a.length - b.length);
+        pkg.dependencyChain = formatDependencyChain(paths[0]);
+      } else {
+        pkg.dependencyChain = 'Not found in dependency graph';
+      }
+    }
+
     return pkg;
   });
 
@@ -258,6 +310,8 @@ Each patch object must have:
 - "name": (string) the name of the npm package to upgrade or override.
 - "version": (string) the recommended version string (e.g. "^4.21.2").
 - "type": (string) "dependencies", "devDependencies", or "overrides".
+- "confidence": (number) a confidence score between 0.0 and 1.0 representing how safe and effective the upgrade is.
+- "risk": (string) "low", "medium", or "high" describing the residual risk.
 - "reason": (string) explanation of why this upgrade is proposed, referencing risk (EPSS/KEV) and dependency resolution.
 
 Example:
@@ -267,6 +321,8 @@ Example:
       "name": "express",
       "version": "^4.21.2",
       "type": "dependencies",
+      "confidence": 0.93,
+      "risk": "low",
       "reason": "Upgrading Express resolves the vulnerable transitive dependency path-to-regexp (high EPSS) and avoids direct override complexity."
     }
   ]

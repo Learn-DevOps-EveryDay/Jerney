@@ -177,6 +177,21 @@ jobs:
           name: "${{ matrix.component }}-vulnerability-results"
           path: trivy-results.json
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Generate Dependency Graph
+        working-directory: ${{ matrix.component }}
+        run: |
+          npm ci --ignore-scripts || npm install --ignore-scripts
+          npm ls --all --json > dependency-graph.json || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.component }}-dependency-graph"
+          path: ${{ matrix.component }}/dependency-graph.json
+
 # ============================================================
 # STAGE 5 — GEMINI AI ANALYSIS
 # ============================================================
@@ -209,6 +224,11 @@ jobs:
           name: "${{ matrix.component }}-sbom"
           path: .
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: "${{ matrix.component }}-dependency-graph"
+          path: .
+
       - name: Install Gemini SDK
         run: npm install @google/generative-ai --no-save
 
@@ -218,7 +238,8 @@ jobs:
         run: |
           node .github/scripts/gemini-analysis.js \
             "$COMPONENT-sbom.json" \
-            "trivy-results.json"
+            "trivy-results.json" \
+            "dependency-graph.json"
 
       - uses: actions/upload-artifact@v4
         with:
