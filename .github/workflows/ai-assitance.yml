@@ -1,0 +1,385 @@
+name: AI-Augmented DevSecOps Pipeline
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: ["*"]
+
+permissions:
+  contents: read
+  security-events: write
+  packages: write
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+
+  # ============================================================
+  # STAGE 1 — LINT + UNIT TESTS
+  # ============================================================
+  quality-gate:
+    name: "🔍 Quality Gate"
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        component: [backend, frontend]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: "${{ matrix.component }}/package-lock.json"
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.component }}
+        run: npm ci
+
+      - name: Run ESLint
+        working-directory: ${{ matrix.component }}
+        run: npm run lint
+
+      - name: Run Unit Tests
+        working-directory: ${{ matrix.component }}
+        run: npm test -- --ci
+
+  # ============================================================
+  # STAGE 2 — SBOM GENERATION
+  # ============================================================
+  sbom:
+    name: "📦 Generate SBOM"
+    runs-on: ubuntu-latest
+    needs: quality-gate
+
+    strategy:
+      matrix:
+        component: [backend, frontend]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM using Syft
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./${{ matrix.component }}
+          format: spdx-json
+          output-file: "${{ matrix.component }}-sbom.json"
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.component }}-sbom"
+          path: "${{ matrix.component }}-sbom.json"
+
+  # ============================================================
+  # STAGE 3 — VULNERABILITY SCANNING
+  # ============================================================
+  vulnerability-scan:
+    name: "🛡️ Vulnerability Scan"
+    runs-on: ubuntu-latest
+    needs: sbom
+
+    strategy:
+      matrix:
+        component: [backend, frontend]
+
+    outputs:
+      vulnerable: ${{ steps.check.outputs.vulnerable }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: "${{ matrix.component }}-sbom"
+
+      - name: Scan SBOM with Grype
+        id: grype
+        uses: anchore/scan-action@v3
+        with:
+          sbom: "${{ matrix.component }}-sbom.json"
+          fail-build: false
+          severity-cutoff: high
+
+      - name: Run Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: ./${{ matrix.component }}
+          format: json
+          output: trivy-results.json
+          severity: HIGH,CRITICAL
+
+      - name: Check if vulnerabilities exist
+        id: check
+        run: |
+          if grep -q "CRITICAL" trivy-results.json; then
+            echo "vulnerable=true" >> $GITHUB_OUTPUT
+          else
+            echo "vulnerable=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.component }}-scan-results"
+          path: |
+            trivy-results.json
+
+  # ============================================================
+  # STAGE 4 — GEMINI AI REMEDIATION ANALYSIS
+  # ============================================================
+  gemini-analysis:
+    name: "🤖 Gemini Dependency Analysis"
+    runs-on: ubuntu-latest
+    needs: vulnerability-scan
+
+    strategy:
+      matrix:
+        component: [backend, frontend]
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: "${{ matrix.component }}-scan-results"
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: "${{ matrix.component }}-sbom"
+
+      - name: Install Gemini SDK
+        run: npm install @google/generative-ai
+
+      - name: Run Gemini Analysis
+        run: |
+          node .github/scripts/gemini-analysis.js \
+            "${{ matrix.component }}-sbom.json" \
+            "trivy-results.json"
+
+      - name: Upload AI recommendations
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.component }}-ai-remediation"
+          path: remediation-report.json
+
+  # ============================================================
+  # STAGE 5 — AUTOMATED DEPENDENCY PATCHING
+  # ============================================================
+  remediation:
+    name: "🩹 Apply AI Remediation"
+    runs-on: ubuntu-latest
+    needs: gemini-analysis
+
+    strategy:
+      matrix:
+        component: [backend, frontend]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download remediation report
+        uses: actions/download-artifact@v4
+        with:
+          name: "${{ matrix.component }}-ai-remediation"
+
+      - name: Apply dependency upgrades
+        run: |
+          node .github/scripts/apply-remediation.js \
+            remediation-report.json \
+            ${{ matrix.component }}
+
+      - name: Install updated dependencies
+        working-directory: ${{ matrix.component }}
+        run: npm install
+
+      - name: Run tests after remediation
+        working-directory: ${{ matrix.component }}
+        run: |
+          npm run lint
+          npm test -- --ci
+          npm run build
+
+      - name: Upload updated lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ matrix.component }}-updated-lockfile"
+          path: |
+            ${{ matrix.component }}/package-lock.json
+            ${{ matrix.component }}/package.json
+
+  # ============================================================
+  # STAGE 6 — BUILD CONTAINERS
+  # ============================================================
+  build:
+    name: "🐳 Build Containers"
+    runs-on: ubuntu-latest
+    needs: remediation
+
+    strategy:
+      matrix:
+        component: [backend, frontend]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.component }}
+          file: ./${{ matrix.component }}/Dockerfile
+          push: false
+          tags: ghcr.io/${{ github.repository }}/${{ matrix.component }}:${{ github.sha }}
+          provenance: true
+          sbom: true
+
+  # ============================================================
+  # STAGE 7 — CONTAINER IMAGE SCANNING
+  # ============================================================
+  image-security:
+    name: "🔬 Container Security"
+    runs-on: ubuntu-latest
+    needs: build
+
+    strategy:
+      matrix:
+        component: [backend, frontend]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image locally
+        run: |
+          docker build \
+            -t ${{ matrix.component }}:${{ github.sha }} \
+            ./${{ matrix.component }}
+
+      - name: Run Trivy Image Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ matrix.component }}:${{ github.sha }}"
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+
+      - name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ============================================================
+  # STAGE 8 — RUNTIME VALIDATION
+  # ============================================================
+  runtime-validation:
+    name: "🚀 Runtime Validation"
+    runs-on: ubuntu-latest
+    needs: image-security
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start application stack
+        run: docker compose up -d --build
+
+      - name: Wait for startup
+        run: sleep 30
+
+      - name: Backend health check
+        run: curl -f http://localhost:3000/health
+
+      - name: Frontend validation
+        run: curl -f http://localhost:8080
+
+      - name: API smoke tests
+        run: |
+          curl -X GET http://localhost:3000/api/status
+
+      - name: Stop application stack
+        if: always()
+        run: docker compose down
+
+  # ============================================================
+  # STAGE 9 — METRICS + FINAL REPORT
+  # ============================================================
+  thesis-metrics:
+    name: "📊 Thesis Metrics"
+    runs-on: ubuntu-latest
+    needs: runtime-validation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Aggregate metrics
+        run: |
+          mkdir -p metrics
+
+          echo "Build Success: PASS" >> metrics/results.txt
+          echo "Runtime Validation: PASS" >> metrics/results.txt
+          echo "Pipeline Completed Successfully" >> metrics/results.txt
+
+      - name: Upload metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: thesis-metrics
+          path: metrics/
+
+      - name: Generate Summary
+        run: |
+          echo "# AI-Assisted Remediation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Vulnerability Scan Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- Gemini Analysis Executed" >> $GITHUB_STEP_SUMMARY
+          echo "- Dependency Remediation Applied" >> $GITHUB_STEP_SUMMARY
+          echo "- Runtime Validation Passed" >> $GITHUB_STEP_SUMMARY
