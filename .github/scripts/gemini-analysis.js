@@ -253,7 +253,7 @@ async function main() {
       };
     });
     pkg.fixedVersions = Array.from(pkg.fixedVersions);
-    
+
     // Attach Dependency Chain
     if (graphData && graphData.dependencies) {
       const paths = findDependencyPaths(graphData.dependencies, pkg.name);
