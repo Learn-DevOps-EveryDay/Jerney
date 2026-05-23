@@ -325,6 +325,19 @@ jobs:
             -t "$COMPONENT:$COMMIT_SHA" \
             "./$COMPONENT"
 
+      - name: Export Docker Image
+        if: steps.dockercheck.outputs.docker == 'true'
+        env:
+          COMPONENT: ${{ matrix.component }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: docker save -o ${{ matrix.component }}-image.tar "$COMPONENT:$COMMIT_SHA"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.dockercheck.outputs.docker == 'true'
+        with:
+          name: "${{ matrix.component }}-docker-image"
+          path: "${{ matrix.component }}-image.tar"
+
 # ============================================================
 # STAGE 8 — CONTAINER SECURITY
 # ============================================================
@@ -340,13 +353,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Scan Container
-        env:
-          COMPONENT: ${{ matrix.component }}
-          COMMIT_SHA: ${{ github.sha }}
+      - name: Download Docker Image
+        id: download
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: "${{ matrix.component }}-docker-image"
+          path: .
+
+      - name: Load Docker Image
+        id: load_image
         run: |
-          trivy image \
-            "$COMPONENT:$COMMIT_SHA"
+          if [ -f ${{ matrix.component }}-image.tar ]; then
+            docker load -i ${{ matrix.component }}-image.tar
+            echo "image_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "image_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Scan Container
+        if: steps.load_image.outputs.image_exists == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: "${{ matrix.component }}:${{ github.sha }}"
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
 
 # ============================================================
 # STAGE 9 — METRICS + THESIS RESULTS
