@@ -41,9 +41,14 @@ function main() {
 
   let modified = false;
   for (const patch of report.patches) {
+    if (patch.valid === false) {
+      console.warn(`Skipping invalid patch for ${patch.name}: ${patch.reason || 'Validation failed.'}`);
+      continue;
+    }
+
     const { name, version, type } = patch;
     if (!name || !version) {
-      console.warn('Skipping invalid patch:', patch);
+      console.warn('Skipping invalid patch format:', patch);
       continue;
     }
 
