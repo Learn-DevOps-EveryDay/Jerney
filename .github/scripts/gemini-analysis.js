@@ -112,10 +112,10 @@ async function main() {
       if (result.Vulnerabilities) {
         for (const vuln of result.Vulnerabilities) {
           const pkgName = vuln.PkgName;
-          
+
           if (!seenPackages.has(pkgName)) {
             seenPackages.add(pkgName);
-            
+
             // Determine if direct dependency and its type
             let depType = 'transitive';
             if (packageJson.dependencies && packageJson.dependencies[pkgName]) {
@@ -123,7 +123,7 @@ async function main() {
             } else if (packageJson.devDependencies && packageJson.devDependencies[pkgName]) {
               depType = 'devDependencies';
             }
-            
+
             vulnerablePackages.push({
               name: pkgName,
               installedVersion: vuln.InstalledVersion,
@@ -194,7 +194,7 @@ Example:
     const response = await model.generateContent(prompt);
     const resultText = response.response.text();
     console.log('Gemini raw response:', resultText);
-    
+
     // Parse response
     const parsed = JSON.parse(resultText);
     if (parsed && Array.isArray(parsed.patches)) {
