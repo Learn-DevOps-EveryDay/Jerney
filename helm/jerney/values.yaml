@@ -17,7 +17,7 @@ db:
 
 backend:
   replicaCount: 2
-  image: ghcr.io/Learn-DevOps-EveryDay/jerney/jerney-backend:0eefb57
+  image: ghcr.io/Learn-DevOps-EveryDay/jerney/jerney-backend:cf53bc7
   resources:
     requests:
       cpu: 100m
@@ -28,7 +28,7 @@ backend:
 
 frontend:
   replicaCount: 2
-  image: ghcr.io/Learn-DevOps-EveryDay/jerney/jerney-frontend:0eefb57
+  image: ghcr.io/Learn-DevOps-EveryDay/jerney/jerney-frontend:cf53bc7
   service:
     type: NodePort
     port: 80
