@@ -2,8 +2,9 @@ name: AI-Augmented DevSecOps Pipeline
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: ["*"]
   pull_request:
+    branches: ["*"]
 
 permissions:
   contents: read
