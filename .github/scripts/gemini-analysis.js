@@ -2,6 +2,58 @@ const fs = require('fs');
 const path = require('path');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+async function getBestModel(apiKey) {
+  const defaultModel = 'gemini-1.5-flash';
+  try {
+    console.log('Querying available models from Google AI API...');
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+    if (!response.ok) {
+      console.warn(`ListModels API request failed with status ${response.status}. Using default model ${defaultModel}.`);
+      return defaultModel;
+    }
+    const data = await response.json();
+    if (!data || !Array.isArray(data.models)) {
+      console.warn(`Invalid response format from ListModels. Using default model ${defaultModel}.`);
+      return defaultModel;
+    }
+
+    const availableModels = data.models
+      .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent'))
+      .map(m => m.name.replace('models/', ''));
+
+    console.log('Available models supporting generateContent:', availableModels);
+
+    // Order of preference
+    const preferences = [
+      'gemini-1.5-flash',
+      'gemini-1.5-flash-latest',
+      'gemini-2.5-flash',
+      'gemini-2.0-flash',
+      'gemini-1.5-flash-8b',
+      'gemini-1.5-pro',
+      'gemini-1.5-pro-latest',
+      'gemini-2.5-pro'
+    ];
+
+    for (const pref of preferences) {
+      if (availableModels.includes(pref)) {
+        console.log(`Selected model based on preference: ${pref}`);
+        return pref;
+      }
+    }
+
+    // Fallback to the first available model if none of preferences match
+    if (availableModels.length > 0) {
+      console.log(`No preferred models found. Selecting first available: ${availableModels[0]}`);
+      return availableModels[0];
+    }
+  } catch (err) {
+    console.warn(`Error resolving available models:`, err.message);
+  }
+  console.log(`Using default model: ${defaultModel}`);
+  return defaultModel;
+}
+
 async function main() {
   const sbomPath = process.argv[2];
   const trivyPath = process.argv[3];
@@ -94,10 +146,14 @@ async function main() {
 
   console.log(`Found ${vulnerablePackages.length} vulnerable packages to analyze.`);
 
+  // Resolve best model dynamically
+  const resolvedModel = await getBestModel(apiKey);
+  console.log(`Resolved target model: ${resolvedModel}`);
+
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
+      model: resolvedModel,
       generationConfig: {
         responseMimeType: 'application/json',
       },
