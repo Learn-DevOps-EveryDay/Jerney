@@ -54,6 +54,52 @@ async function getBestModel(apiKey) {
   return defaultModel;
 }
 
+async function fetchCisaKev() {
+  console.log('Fetching CISA KEV catalog...');
+  const kevSet = new Set();
+  try {
+    const res = await fetch('https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json');
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.vulnerabilities) {
+        data.vulnerabilities.forEach(v => kevSet.add(v.cveID));
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to fetch CISA KEV:', err.message);
+  }
+  return kevSet;
+}
+
+async function fetchEpssScores(cves) {
+  if (!cves || cves.length === 0) return {};
+  console.log(`Fetching EPSS scores for ${cves.length} CVEs...`);
+  const epssMap = {};
+  
+  const chunkSize = 50;
+  for (let i = 0; i < cves.length; i += chunkSize) {
+    const chunk = cves.slice(i, i + chunkSize);
+    const cveString = chunk.join(',');
+    try {
+      const res = await fetch(`https://api.first.org/data/v1/epss?cve=${cveString}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.data) {
+          data.data.forEach(item => {
+            epssMap[item.cve] = {
+              epss: parseFloat(item.epss),
+              percentile: parseFloat(item.percentile)
+            };
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to fetch EPSS scores for chunk:', err.message);
+    }
+  }
+  return epssMap;
+}
+
 async function main() {
   const sbomPath = process.argv[2];
   const trivyPath = process.argv[3];
@@ -103,20 +149,20 @@ async function main() {
     process.exit(0);
   }
 
-  // Extract only the vulnerable packages to send to Gemini
-  const vulnerablePackages = [];
-  const seenPackages = new Set();
+  // Extract vulnerable packages and their CVEs
+  const vulnerablePackagesMap = new Map();
+  const cveSet = new Set();
 
   if (trivyData.Results) {
     for (const result of trivyData.Results) {
       if (result.Vulnerabilities) {
         for (const vuln of result.Vulnerabilities) {
           const pkgName = vuln.PkgName;
+          const cveId = vuln.VulnerabilityID;
+          
+          if (cveId) cveSet.add(cveId);
 
-          if (!seenPackages.has(pkgName)) {
-            seenPackages.add(pkgName);
-
-            // Determine if direct dependency and its type
+          if (!vulnerablePackagesMap.has(pkgName)) {
             let depType = 'transitive';
             if (packageJson.dependencies && packageJson.dependencies[pkgName]) {
               depType = 'dependencies';
@@ -124,25 +170,51 @@ async function main() {
               depType = 'devDependencies';
             }
 
-            vulnerablePackages.push({
+            vulnerablePackagesMap.set(pkgName, {
               name: pkgName,
               installedVersion: vuln.InstalledVersion,
-              fixedVersion: vuln.FixedVersion || 'None',
-              severity: vuln.Severity,
+              fixedVersions: new Set(),
               type: depType,
-              vulnerabilityId: vuln.VulnerabilityID
+              vulnerabilities: []
             });
           }
+
+          const pkgData = vulnerablePackagesMap.get(pkgName);
+          if (vuln.FixedVersion) pkgData.fixedVersions.add(vuln.FixedVersion);
+          
+          pkgData.vulnerabilities.push({
+            id: cveId,
+            severity: vuln.Severity
+          });
         }
       }
     }
   }
 
-  if (vulnerablePackages.length === 0) {
+  if (vulnerablePackagesMap.size === 0) {
     console.log('No vulnerable packages found. Generating empty remediation report.');
     fs.writeFileSync(reportPath, JSON.stringify(defaultReport, null, 2));
     process.exit(0);
   }
+
+  // Fetch Threat Intel Enrichments
+  const kevSet = await fetchCisaKev();
+  const epssMap = await fetchEpssScores(Array.from(cveSet));
+
+  // Build final array with enrichment
+  const vulnerablePackages = Array.from(vulnerablePackagesMap.values()).map(pkg => {
+    pkg.vulnerabilities = pkg.vulnerabilities.map(v => {
+      const epss = epssMap[v.id] || { epss: 0, percentile: 0 };
+      return {
+        ...v,
+        isKnownExploited: kevSet.has(v.id),
+        epssScore: epss.epss,
+        epssPercentile: epss.percentile
+      };
+    });
+    pkg.fixedVersions = Array.from(pkg.fixedVersions);
+    return pkg;
+  });
 
   console.log(`Found ${vulnerablePackages.length} vulnerable packages to analyze.`);
 
@@ -161,31 +233,41 @@ async function main() {
 
     const prompt = `
 You are a senior DevSecOps engineer.
-Below is the list of vulnerable packages detected in the "${component}" component:
+Below is the list of vulnerable packages detected in the "${component}" component, enriched with EPSS (Exploit Prediction Scoring System) and CISA KEV (Known Exploited Vulnerabilities) data:
 
 ${JSON.stringify(vulnerablePackages, null, 2)}
 
 Task:
-1. For each package, if a "fixedVersion" is available, recommend upgrading it to the fixed version (or a safe compatible version solving the vulnerability).
-2. If the package is a 'transitive' dependency, recommend upgrading the direct dependency that uses it, or specify it as a patch if npm can override it.
-3. Output the remediation patches.
+Analyze the vulnerabilities and formulate a safe remediation plan. Prioritize fixes for packages with Known Exploited Vulnerabilities (isKnownExploited: true) or high EPSS scores.
+
+Decision Tree for Remediation:
+1. Direct dependency (type: "dependencies" or "devDependencies"):
+   - Recommend upgrading it directly to a fixed version (or a safe compatible version).
+
+2. Transitive dependency (type: "transitive"):
+   - Find the direct parent dependency that brings in this transitive package.
+   - Check if upgrading the direct parent dependency resolves the CVE.
+   - If YES: Recommend upgrading the parent dependency.
+   - If NO (or parent upgrade is not viable): Recommend using npm overrides. Specify the patch with "type": "overrides".
+
+Prefer upgrading direct parent dependencies before recommending npm overrides for transitive packages.
 
 Response Format:
 Return a JSON object with a single top-level key "patches" which contains an array of objects.
 Each patch object must have:
-- "name": (string) the name of the npm package to upgrade.
-- "version": (string) the recommended version string (e.g. "^4.21.1").
-- "type": (string) either "dependencies" or "devDependencies" based on where the package is located.
-- "reason": (string) a short explanation of why this upgrade is proposed.
+- "name": (string) the name of the npm package to upgrade or override.
+- "version": (string) the recommended version string (e.g. "^4.21.2").
+- "type": (string) "dependencies", "devDependencies", or "overrides".
+- "reason": (string) explanation of why this upgrade is proposed, referencing risk (EPSS/KEV) and dependency resolution.
 
 Example:
 {
   "patches": [
     {
       "name": "express",
-      "version": "^4.21.1",
+      "version": "^4.21.2",
       "type": "dependencies",
-      "reason": "Resolves CVE-2024-XXXX by upgrading to fixed version."
+      "reason": "Upgrading Express resolves the vulnerable transitive dependency path-to-regexp (high EPSS) and avoids direct override complexity."
     }
   ]
 }
