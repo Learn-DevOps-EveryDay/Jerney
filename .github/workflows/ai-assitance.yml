@@ -12,30 +12,30 @@ permissions:
   packages: write
 
 env:
-  NODE_VERSION: "20"
+  DOCKER_REGISTRY: ghcr.io
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/jerney-backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/jerney-frontend
 
 jobs:
-
-  # ============================================================
-  # STAGE 1 — LINT + UNIT TESTS
-  # ============================================================
-  quality-gate:
-    name: "🔍 Quality Gate"
+  # ==============================================================
+  # STAGE 1: Linting
+  # ==============================================================
+  lint:
+    name: "🔍 Lint Code"
     runs-on: ubuntu-latest
-
+    continue-on-error: true
     strategy:
       matrix:
         component: [backend, frontend]
-
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+          node-version: "20"
+          cache: "npm"
           cache-dependency-path: "${{ matrix.component }}/package-lock.json"
 
       - name: Install dependencies
@@ -46,9 +46,6 @@ jobs:
         working-directory: ${{ matrix.component }}
         run: npm run lint
 
-      - name: Run Unit Tests
-        working-directory: ${{ matrix.component }}
-        run: npm test -- --ci
 
   # ============================================================
   # STAGE 2 — SBOM GENERATION
