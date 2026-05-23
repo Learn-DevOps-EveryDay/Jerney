@@ -51,32 +51,48 @@ async function main() {
     process.exit(0);
   }
 
-  // Extract relevant vulnerabilities to keep the prompt size reasonable
-  const vulnerabilities = [];
+  // Extract only the vulnerable packages to send to Gemini
+  const vulnerablePackages = [];
+  const seenPackages = new Set();
+
   if (trivyData.Results) {
     for (const result of trivyData.Results) {
       if (result.Vulnerabilities) {
         for (const vuln of result.Vulnerabilities) {
-          vulnerabilities.push({
-            id: vuln.VulnerabilityID,
-            package: vuln.PkgName,
-            installedVersion: vuln.InstalledVersion,
-            fixedVersion: vuln.FixedVersion || 'None',
-            severity: vuln.Severity,
-            title: vuln.Title || ''
-          });
+          const pkgName = vuln.PkgName;
+          
+          if (!seenPackages.has(pkgName)) {
+            seenPackages.add(pkgName);
+            
+            // Determine if direct dependency and its type
+            let depType = 'transitive';
+            if (packageJson.dependencies && packageJson.dependencies[pkgName]) {
+              depType = 'dependencies';
+            } else if (packageJson.devDependencies && packageJson.devDependencies[pkgName]) {
+              depType = 'devDependencies';
+            }
+            
+            vulnerablePackages.push({
+              name: pkgName,
+              installedVersion: vuln.InstalledVersion,
+              fixedVersion: vuln.FixedVersion || 'None',
+              severity: vuln.Severity,
+              type: depType,
+              vulnerabilityId: vuln.VulnerabilityID
+            });
+          }
         }
       }
     }
   }
 
-  if (vulnerabilities.length === 0) {
-    console.log('No vulnerabilities found. Generating empty remediation report.');
+  if (vulnerablePackages.length === 0) {
+    console.log('No vulnerable packages found. Generating empty remediation report.');
     fs.writeFileSync(reportPath, JSON.stringify(defaultReport, null, 2));
     process.exit(0);
   }
 
-  console.log(`Found ${vulnerabilities.length} vulnerabilities to analyze.`);
+  console.log(`Found ${vulnerablePackages.length} vulnerable packages to analyze.`);
 
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
@@ -88,23 +104,15 @@ async function main() {
     });
 
     const prompt = `
-You are a senior DevSecOps engineer and security automated agent.
-Analyze the following vulnerabilities found in the component "${component}" and propose a safe remediation plan.
+You are a senior DevSecOps engineer.
+Below is the list of vulnerable packages detected in the "${component}" component:
 
-Component package.json dependencies:
-${JSON.stringify({
-  dependencies: packageJson.dependencies || {},
-  devDependencies: packageJson.devDependencies || {}
-}, null, 2)}
-
-Vulnerabilities found by Trivy:
-${JSON.stringify(vulnerabilities, null, 2)}
+${JSON.stringify(vulnerablePackages, null, 2)}
 
 Task:
-1. For each vulnerability that has a "fixedVersion" available, determine if it is safe to upgrade the package.
-2. Formulate the required upgrades (patches) to resolve these vulnerabilities.
-3. Ensure the versions you suggest are compatible and resolve the issue. If the vulnerability is in a transitive dependency (not directly in package.json), suggest upgrading the direct dependency that brings it in, or suggest the package fix directly so npm can resolve it.
-4. Output the recommendations in the specified JSON format.
+1. For each package, if a "fixedVersion" is available, recommend upgrading it to the fixed version (or a safe compatible version solving the vulnerability).
+2. If the package is a 'transitive' dependency, recommend upgrading the direct dependency that uses it, or specify it as a patch if npm can override it.
+3. Output the remediation patches.
 
 Response Format:
 Return a JSON object with a single top-level key "patches" which contains an array of objects.
