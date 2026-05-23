@@ -80,9 +80,27 @@ jobs:
       # npm audit for known vulnerabilities (fail on high/critical)
       - name: npm audit
         working-directory: ${{ matrix.component }}
-        run: npm audit --audit-level=high || true
-        # `|| true` to not fail on moderate — adjust in prod
+        run: npm audit --audit-level=high || true # `|| true` to not fail on moderate — adjust in prod
 
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./${{ matrix.component }}
+          format: 'spdx-json'
+          output-file: "${{ matrix.component }}.sbom.spdx.json"
+
+      - name: Scan SBOM (Grype)
+        uses: anchore/scan-action@v3
+        with:
+          sbom: "${{ matrix.component }}.sbom.spdx.json"
+          fail-build: false
+          severity-cutoff: high
+
+      - name: Upload SBOM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.component }}
+          path: "${{ matrix.component }}.sbom.spdx.json"
   # ==============================================================
   # STAGE 3: Build & Push Container Images
   # ==============================================================
