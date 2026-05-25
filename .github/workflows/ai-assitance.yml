@@ -2,9 +2,9 @@ name: Experimental DevSecOps Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "devops" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "devops" ]
   workflow_dispatch:
 
 permissions:
