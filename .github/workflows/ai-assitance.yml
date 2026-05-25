@@ -1,444 +1,206 @@
-name: AI-Augmented DevSecOps Pipeline
+name: Experimental DevSecOps Pipeline
 
 on:
   push:
-    branches: ["*"]
+    branches: [ "main" ]
   pull_request:
-    branches: ["*"]
+    branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
-  contents: read
-
-env:
-  NODE_VERSION: "20"
+  contents: write
 
 jobs:
-
-# ============================================================
-# STAGE 1 — PROJECT CAPABILITY DETECTION
-# ============================================================
-  capability-detection:
-    name: "🔎 Detect Project Capabilities"
+  # ==========================================
+  # PHASE 1: GENERATION & BASELINE
+  # ==========================================
+  dependency-graphs:
+    name: "📊 Generate Dependency Graphs"
     runs-on: ubuntu-latest
-
-    outputs:
-      capabilities: ${{ steps.detect.outputs.capabilities }}
-
+    strategy:
+      matrix:
+        component: ['backend', 'frontend', 'api']
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        if: matrix.component != 'api'
+        uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Detect capabilities
-        id: detect
+          node-version: 20
+      - name: Setup Python
+        if: matrix.component == 'api'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Generate NPM Graph
+        if: matrix.component != 'api'
+        working-directory: ${{ matrix.component }}
         run: |
-          JSON_OUT="{"
-          for component in backend frontend; do
-            cd "$component"
-            npm run > scripts.txt || true
+          npm install --package-lock-only --ignore-scripts
+          npm ls --all --json > ../${{ matrix.component }}-deps.json || true
+      
+      - name: Generate PyPI Graph
+        if: matrix.component == 'api'
+        working-directory: ${{ matrix.component }}
+        run: |
+          echo '{"dependencies": {}}' > ../api-deps.json
 
-            if grep -q "lint" scripts.txt; then
-              has_lint="true"
-            else
-              has_lint="false"
-            fi
-
-            if grep -q "test" scripts.txt; then
-              has_test="true"
-            else
-              has_test="false"
-            fi
-
-            if grep -q "build" scripts.txt; then
-              has_build="true"
-            else
-              has_build="false"
-            fi
-
-            if [ -f Dockerfile ]; then
-              has_dockerfile="true"
-            else
-              has_dockerfile="false"
-            fi
-
-            JSON_OUT="${JSON_OUT}\"${component}\":{\"has_lint\":${has_lint},\"has_test\":${has_test},\"has_build\":${has_build},\"has_dockerfile\":${has_dockerfile}},"
-            cd ..
-          done
-          JSON_OUT="${JSON_OUT%,}}"
-          echo "capabilities=${JSON_OUT}" >> $GITHUB_OUTPUT
-
-# ============================================================
-# STAGE 2 — QUALITY VALIDATION
-# ============================================================
-  quality-validation:
-    name: "🔍 Quality Validation"
-    runs-on: ubuntu-latest
-    needs: capability-detection
-
-    strategy:
-      matrix:
-        component: [backend, frontend]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/upload-artifact@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: "${{ matrix.component }}/package-lock.json"
+          name: ${{ matrix.component }}-deps
+          path: ${{ matrix.component }}-deps.json
+          retention-days: 1
 
-      - name: Install dependencies
-        working-directory: ${{ matrix.component }}
-        run: npm ci
-
-      - name: Run ESLint
-        if: fromJSON(needs.capability-detection.outputs.capabilities)[matrix.component].has_lint
-        working-directory: ${{ matrix.component }}
-        run: npm run lint
-
-      - name: Run Unit Tests
-        if: fromJSON(needs.capability-detection.outputs.capabilities)[matrix.component].has_test
-        working-directory: ${{ matrix.component }}
-        run: npm test -- --ci
-
-      - name: Run Build
-        if: fromJSON(needs.capability-detection.outputs.capabilities)[matrix.component].has_build
-        working-directory: ${{ matrix.component }}
-        run: npm run build
-
-# ============================================================
-# STAGE 3 — SBOM GENERATION
-# ============================================================
-  sbom:
-    name: "📦 Generate SBOM"
+  vulnerability-scanning:
+    name: "🔍 SBOM & Vulnerability Scan (Grype)"
     runs-on: ubuntu-latest
-    needs: quality-validation
-
     strategy:
       matrix:
-        component: [backend, frontend]
-
+        component: ['backend', 'frontend', 'api']
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Generate SBOM
+      
+      - name: Generate SBOM (Syft)
         uses: anchore/sbom-action@v0
         with:
           path: ./${{ matrix.component }}
           format: spdx-json
-          output-file: "${{ matrix.component }}-sbom.json"
+          output-file: ${{ matrix.component }}-sbom.spdx.json
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: "${{ matrix.component }}-sbom"
-          path: "${{ matrix.component }}-sbom.json"
-
-# ============================================================
-# STAGE 4 — VULNERABILITY ANALYSIS
-# ============================================================
-  vulnerability-analysis:
-    name: "🛡️ Vulnerability Analysis"
-    runs-on: ubuntu-latest
-    needs: sbom
-
-    strategy:
-      matrix:
-        component: [backend, frontend]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: "${{ matrix.component }}-sbom"
-          path: .
-
-      - name: Run Grype
+      - name: Scan Vulnerabilities (Grype)
         uses: anchore/scan-action@v3
         with:
-          sbom: "${{ matrix.component }}-sbom.json"
+          sbom: ${{ matrix.component }}-sbom.spdx.json
+          output-format: json
           fail-build: false
-          severity-cutoff: high
-
-      - name: Run Trivy
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: ./${{ matrix.component }}
-          format: json
-          output: trivy-results.json
-          severity: HIGH,CRITICAL
+        id: scan
+      
+      - name: Rename Grype Output
+        run: mv ${{ steps.scan.outputs.json }} ${{ matrix.component }}-grype.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: "${{ matrix.component }}-vulnerability-results"
-          path: trivy-results.json
+          name: ${{ matrix.component }}-grype
+          path: ${{ matrix.component }}-grype.json
+          retention-days: 1
 
+  # ==========================================
+  # PHASE 2: ENRICHMENT & REGISTRATION
+  # ==========================================
+  enrich-and-register:
+    name: "📝 Pre-Register Scenarios"
+    needs: [dependency-graphs, vulnerability-scanning]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Generate Dependency Graph
-        working-directory: ${{ matrix.component }}
-        run: |
-          npm ci --ignore-scripts || npm install --ignore-scripts
-          npm ls --all --json > dependency-graph.json || true
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: "${{ matrix.component }}-dependency-graph"
-          path: ${{ matrix.component }}/dependency-graph.json
-
-# ============================================================
-# STAGE 5 — GEMINI AI ANALYSIS
-# ============================================================
-  gemini-analysis:
-    name: "🤖 Gemini Compatibility Analysis"
-    runs-on: ubuntu-latest
-    needs: vulnerability-analysis
-
-    strategy:
-      matrix:
-        component: [backend, frontend]
-
-    env:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: "${{ matrix.component }}-vulnerability-results"
-          path: .
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: "${{ matrix.component }}-sbom"
-          path: .
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: "${{ matrix.component }}-dependency-graph"
-          path: .
-
-      - name: Install Gemini SDK
-        run: npm install @google/generative-ai --no-save
-
-      - name: Run Gemini Dependency Reasoning
-        env:
-          COMPONENT: ${{ matrix.component }}
-        run: |
-          node .github/scripts/gemini-analysis.js \
-            "$COMPONENT-sbom.json" \
-            "trivy-results.json" \
-            "dependency-graph.json"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: "${{ matrix.component }}-remediation-plan"
-          path: remediation-report.json
-
-# ============================================================
-# STAGE 5.5 — RECOMMENDATION VALIDATION
-# ============================================================
-  recommendation-validation:
-    name: "✅ Validate AI Recommendations"
-    runs-on: ubuntu-latest
-    needs: gemini-analysis
-
-    strategy:
-      matrix:
-        component: [backend, frontend]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: "${{ matrix.component }}-remediation-plan"
-          path: .
-
-      - name: Validate NPM Registry
-        run: |
-          node .github/scripts/validate-recommendations.js \
-            remediation-report.json \
-            validated-remediation-report.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: "${{ matrix.component }}-validated-remediation-plan"
-          path: validated-remediation-report.json
-
-# ============================================================
-# STAGE 6 — APPLY REMEDIATION
-# ============================================================
-  remediation:
-    name: "🩹 Apply Dependency Remediation"
-    runs-on: ubuntu-latest
-    needs: recommendation-validation
-
-    strategy:
-      matrix:
-        component: [backend, frontend]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: "${{ matrix.component }}-validated-remediation-plan"
-          path: .
-
-      - name: Apply dependency fixes
-        env:
-          COMPONENT: ${{ matrix.component }}
-        run: |
-          node .github/scripts/apply-remediation.js \
-            validated-remediation-report.json \
-            "$COMPONENT"
-
-      - name: Install updated dependencies
-        working-directory: ${{ matrix.component }}
-        run: npm install
-
-      - name: Validate remediation
-        working-directory: ${{ matrix.component }}
-        run: |
-
-          npm run lint || true
-          npm test -- --ci || true
-          npm run build || true
-
-# ============================================================
-# STAGE 7 — CONTAINER BUILD
-# ============================================================
-  container-build:
-    name: "🐳 Build Containers"
-    runs-on: ubuntu-latest
-    needs: remediation
-
-    strategy:
-      matrix:
-        component: [backend, frontend]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check Dockerfile
-        id: dockercheck
-        working-directory: ${{ matrix.component }}
-        run: |
-          if [ -f Dockerfile ]; then
-            echo "docker=true" >> $GITHUB_OUTPUT
-          else
-            echo "docker=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Build Docker Image
-        if: steps.dockercheck.outputs.docker == 'true'
-        env:
-          COMPONENT: ${{ matrix.component }}
-          COMMIT_SHA: ${{ github.sha }}
-        run: |
-          docker build \
-            -t "$COMPONENT:$COMMIT_SHA" \
-            "./$COMPONENT"
-
-      - name: Export Docker Image
-        if: steps.dockercheck.outputs.docker == 'true'
-        env:
-          COMPONENT: ${{ matrix.component }}
-          COMMIT_SHA: ${{ github.sha }}
-        run: docker save -o ${{ matrix.component }}-image.tar "$COMPONENT:$COMMIT_SHA"
-
-      - uses: actions/upload-artifact@v4
-        if: steps.dockercheck.outputs.docker == 'true'
-        with:
-          name: "${{ matrix.component }}-docker-image"
-          path: "${{ matrix.component }}-image.tar"
-
-# ============================================================
-# STAGE 8 — CONTAINER SECURITY
-# ============================================================
-  container-security:
-    name: "🔬 Container Security"
-    runs-on: ubuntu-latest
-    needs: container-build
-
-    strategy:
-      matrix:
-        component: [backend, frontend]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Docker Image
-        id: download
+          node-version: 20
+      
+      - name: Download Grype Scans
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
-          name: "${{ matrix.component }}-docker-image"
-          path: .
+          pattern: "*-grype"
+          path: grype-results
+          merge-multiple: true
 
-      - name: Load Docker Image
-        id: load_image
-        run: |
-          if [ -f ${{ matrix.component }}-image.tar ]; then
-            docker load -i ${{ matrix.component }}-image.tar
-            echo "image_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "image_exists=false" >> $GITHUB_OUTPUT
-          fi
+      - name: Enrich Findings
+        run: node .github/scripts/enrich-findings.js grype-results enriched-findings.json
 
-      - name: Scan Container
-        if: steps.load_image.outputs.image_exists == 'true'
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: "${{ matrix.component }}:${{ github.sha }}"
-          format: 'table'
-          exit-code: '0'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
-
-# ============================================================
-# STAGE 9 — METRICS + THESIS RESULTS
-# ============================================================
-  thesis-metrics:
-    name: "📊 Thesis Metrics"
-    runs-on: ubuntu-latest
-    needs: container-security
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate Metrics
-        run: |
-
-          mkdir -p metrics
-
-          echo "Pipeline Completed" >> metrics/results.txt
-          echo "AI Remediation Executed" >> metrics/results.txt
-          echo "Security Validation Completed" >> metrics/results.txt
+      - name: Register Scenarios
+        run: node .github/scripts/register-scenarios.js enriched-findings.json scenarios.json --min-scenarios=30 --max-scenarios=40
+      
+      - name: Generate Deterministic Fixes
+        run: node .github/scripts/generate-deterministic-fixes.js scenarios.json deterministic-plan.json
 
       - uses: actions/upload-artifact@v4
         with:
-          name: thesis-metrics
-          path: metrics/
-          
+          name: registered-scenarios
+          path: |
+            enriched-findings.json
+            scenarios.json
+            deterministic-plan.json
+          retention-days: 1
+
+  # ==========================================
+  # PHASE 3: AI INFERENCE & VALIDATION
+  # ==========================================
+  ai-analysis:
+    name: "🧠 AI Remediation Inference"
+    needs: enrich-and-register
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install @google/generative-ai
+      
+      - uses: actions/download-artifact@v4
+        with:
+          name: registered-scenarios
+      
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-deps"
+          path: deps-graphs
+          merge-multiple: true
+
+      - name: Request AI Recommendations
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: node .github/scripts/gemini-analysis.js scenarios.json deps-graphs raw-ai-plan.json
+
+      - name: Validate Against Registries (NPM/PyPI)
+        run: node .github/scripts/validate-recommendations.js raw-ai-plan.json ai-plan.json
+      
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-plan
+          path: ai-plan.json
+          retention-days: 1
+
+  # ==========================================
+  # PHASE 4: EXPERIMENT RUNNER & METRICS
+  # ==========================================
+  experiment-runner:
+    name: "🧪 Run Validation Gates"
+    needs: ai-analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      # Install Grype CLI for Rescan Gate
+      - name: Install Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: registered-scenarios
+      
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-plan
+      
+      - name: Run Experiment
+        run: node .github/scripts/run-experiment.js scenarios.json deterministic-plan.json ai-plan.json experiment-results.json
+
+      - name: Collect Metrics
+        run: node .github/scripts/collect-metrics.js experiment-results.json thesis-metrics.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thesis-results
+          path: |
+            experiment-results.json
+            thesis-metrics.json
+          retention-days: 5
